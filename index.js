@@ -149,7 +149,7 @@ async function verifyCustomer(customerId) {
 async function getSubscriptionsByCustomer(customerId) {
   try {
     const response = await axios.get(
-      `${GHL_API_V2}/subscriptions/`,
+      ``${GHL_API_V2}/payments/subscriptions`,
       {
         headers: {
           'Authorization': `Bearer ${GHL_API_KEY}`,
@@ -214,7 +214,7 @@ async function getSubscriptionsAlternative(customerId) {
 async function cancelSingleSubscription(subscriptionId) {
   try {
     const response = await axios.delete(
-      `${GHL_API_V2}/subscriptions/${subscriptionId}`,
+      ``${GHL_API_V2}/payments/subscriptions/${subscriptionId}`,
       {
         headers: {
           'Authorization': `Bearer ${GHL_API_KEY}`,
