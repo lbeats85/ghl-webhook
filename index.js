@@ -71,10 +71,10 @@ app.post('/webhook/cancel-subscription', async (req, res) => {
 
     console.log(`Found ${subscriptions.length} subscription(s)`);
 
-    // Step 3: Cancel all active subscriptions
+     // Step 3: Cancel all active, trialing, past_due, and unpaid subscriptions
     const results = [];
     for (const sub of subscriptions) {
-      if (sub.status === 'active' || sub.status === 'trialing') {
+      if (sub.status === 'active' || sub.status === 'trialing' || sub.status === 'past_due' || sub.status === 'unpaid') {
         console.log(`Attempting to cancel subscription ${sub.id} (status: ${sub.status})`);
         const cancelResult = await cancelSingleSubscription(sub.id);
         results.push({
