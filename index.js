@@ -10,7 +10,7 @@ const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;
 const PORT = process.env.PORT || 3000;
 
 // GoHighLevel API v2 Base URL
-const GHL_API_V2 = 'https://services.gohighlevel.com';
+const GHL_API_V2 = 'https://services.leadconnectorhq.com';
 
 /**
  * Main webhook endpoint for subscription cancellation
