@@ -214,7 +214,7 @@ async function getSubscriptionsAlternative(customerId) {
 async function cancelSingleSubscription(subscriptionId) {
   try {
     const response = await axios.delete(
-      ``${GHL_API_V2}/payments/subscriptions/${subscriptionId}`,
+     `${GHL_API_V2}/payments/subscriptions`,
       {
         headers: {
           'Authorization': `Bearer ${GHL_API_KEY}`,
