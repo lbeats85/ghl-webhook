@@ -62,16 +62,16 @@ app.post('/webhook/cancel-subscription', async (req, res) => {
     const subscriptions = await getSubscriptionsByCustomer(customerId);
     
     if (!subscriptions || subscriptions.length === 0) {
-      console.log('No active subscriptions found');
+      console.log('No subscriptions found');
       return res.status(404).json({ 
         success: false, 
-        error: 'No active subscriptions found for this customer' 
+        error: 'No subscriptions found for this customer' 
       });
     }
 
     console.log(`Found ${subscriptions.length} subscription(s)`);
 
-     // Step 3: Cancel all active, trialing, past_due, and unpaid subscriptions
+    // Step 3: Cancel all active, trialing, past_due, and unpaid subscriptions
     const results = [];
     for (const sub of subscriptions) {
       if (sub.status === 'active' || sub.status === 'trialing' || sub.status === 'past_due' || sub.status === 'unpaid') {
@@ -149,7 +149,7 @@ async function verifyCustomer(customerId) {
 async function getSubscriptionsByCustomer(customerId) {
   try {
     const response = await axios.get(
-      ``${GHL_API_V2}/payments/subscriptions`,
+      `${GHL_API_V2}/payments/subscriptions`,
       {
         headers: {
           'Authorization': `Bearer ${GHL_API_KEY}`,
@@ -214,7 +214,7 @@ async function getSubscriptionsAlternative(customerId) {
 async function cancelSingleSubscription(subscriptionId) {
   try {
     const response = await axios.delete(
-     `${GHL_API_V2}/payments/subscriptions`,
+      `${GHL_API_V2}/payments/subscriptions/${subscriptionId}`,
       {
         headers: {
           'Authorization': `Bearer ${GHL_API_KEY}`,
