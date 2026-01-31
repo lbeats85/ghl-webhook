@@ -47,16 +47,16 @@ app.post('/webhook/cancel-subscription', async (req, res) => {
     }
 
     // Get Stripe Customer ID from custom field
-    const stripeCustomerId = contact.customFields?.find(
-      field => field.id === 'Stripe Customer Id' || field.key === 'stripe_customer_id'
-    )?.value || contact['Stripe Customer Id'];
+    const stripeCustomerId = contact.customField?.stripe_customer_id || 
+                             contact.customFields?.stripe_customer_id ||
+                             contact.stripe_customer_id;
 
     if (!stripeCustomerId) {
-      console.error('Stripe Customer ID not found in contact custom fields');
-      console.log('Available custom fields:', JSON.stringify(contact.customFields, null, 2));
+      console.error('Stripe Customer ID not found in contact');
+      console.log('Contact data:', JSON.stringify(contact, null, 2));
       return res.status(404).json({ 
         success: false, 
-        error: 'Stripe Customer ID not found in GoHighLevel contact. Please ensure the "Stripe Customer Id" custom field is populated.' 
+        error: 'Stripe Customer ID not found in GoHighLevel contact. Please ensure the "Stripe Customer Id" custom field (stripe_customer_id) is populated.' 
       });
     }
 
