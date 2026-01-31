@@ -34,24 +34,51 @@ app.post('/webhook/cancel-subscription', async (req, res) => {
       });
     }
 
-    // Step 1: Get subscriptions from GoHighLevel
-    console.log(`Getting subscriptions from GoHighLevel for customer: ${customerId}`);
-    const ghlSubscriptions = await getGHLSubscriptions(customerId);
+    // Step 1: Get contact from GoHighLevel to retrieve Stripe Customer ID
+    console.log(`Getting contact from GoHighLevel: ${customerId}`);
+    const contact = await getGHLContact(customerId);
     
-    if (!ghlSubscriptions || ghlSubscriptions.length === 0) {
-      console.log('No subscriptions found in GoHighLevel');
+    if (!contact) {
+      console.error(`Contact not found: ${customerId}`);
       return res.status(404).json({ 
         success: false, 
-        error: 'No subscriptions found for this customer in GoHighLevel' 
+        error: 'Contact not found in GoHighLevel' 
       });
     }
 
-    console.log(`Found ${ghlSubscriptions.length} subscription(s) in GoHighLevel`);
+    // Get Stripe Customer ID from custom field
+    const stripeCustomerId = contact.customFields?.find(
+      field => field.id === 'Stripe Customer Id' || field.key === 'stripe_customer_id'
+    )?.value || contact['Stripe Customer Id'];
 
-    // Step 2: Cancel subscriptions in Stripe using IDs from GoHighLevel
+    if (!stripeCustomerId) {
+      console.error('Stripe Customer ID not found in contact custom fields');
+      console.log('Available custom fields:', JSON.stringify(contact.customFields, null, 2));
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Stripe Customer ID not found in GoHighLevel contact. Please ensure the "Stripe Customer Id" custom field is populated.' 
+      });
+    }
+
+    console.log(`Stripe Customer ID: ${stripeCustomerId}`);
+
+    // Step 2: Get subscriptions from Stripe for this customer
+    console.log(`Getting subscriptions from Stripe for customer: ${stripeCustomerId}`);
+    const subscriptions = await getStripeSubscriptions(stripeCustomerId);
+    
+    if (!subscriptions || subscriptions.length === 0) {
+      console.log('No subscriptions found in Stripe');
+      return res.status(404).json({ 
+        success: false, 
+        error: 'No subscriptions found for this customer in Stripe' 
+      });
+    }
+
+    console.log(`Found ${subscriptions.length} subscription(s) in Stripe`);
+
+    // Step 3: Cancel subscriptions that are active, trialing, past_due, unpaid, or incomplete
     const results = [];
-    for (const sub of ghlSubscriptions) {
-      // Check if subscription should be canceled based on status
+    for (const sub of subscriptions) {
       const shouldCancel = 
         sub.status === 'active' || 
         sub.status === 'trialing' || 
@@ -59,29 +86,29 @@ app.post('/webhook/cancel-subscription', async (req, res) => {
         sub.status === 'unpaid' ||
         sub.status === 'incomplete';
       
-      if (shouldCancel && sub.entityId) {
-        console.log(`Attempting to cancel Stripe subscription ${sub.entityId} (GHL status: ${sub.status})`);
-        const cancelResult = await cancelStripeSubscription(sub.entityId);
+      if (shouldCancel) {
+        console.log(`Attempting to cancel Stripe subscription ${sub.id} (status: ${sub.status})`);
+        const cancelResult = await cancelStripeSubscription(sub.id);
         results.push({
-          ghlSubscriptionId: sub.id,
-          stripeSubscriptionId: sub.entityId,
+          subscriptionId: sub.id,
           status: sub.status,
           ...cancelResult
         });
       } else {
-        console.log(`Skipping subscription ${sub.id} (status: ${sub.status}, has entityId: ${!!sub.entityId})`);
+        console.log(`Skipping subscription ${sub.id} (status: ${sub.status} - already canceled or ended)`);
       }
     }
 
     if (results.length === 0) {
-      return res.status(404).json({
-        success: false,
-        error: 'No cancellable subscriptions found',
-        totalSubscriptions: ghlSubscriptions.length
+      return res.status(200).json({
+        success: true,
+        message: 'No active subscriptions to cancel',
+        totalSubscriptions: subscriptions.length,
+        canceledCount: 0
       });
     }
 
-    // Step 3: Return results
+    // Step 4: Return results
     const allSuccessful = results.every(r => r.success);
     console.log('=== Cancellation Complete ===');
     console.log(`Success: ${allSuccessful}`);
@@ -93,7 +120,8 @@ app.post('/webhook/cancel-subscription', async (req, res) => {
         'All subscriptions canceled successfully' : 
         'Some subscriptions failed to cancel',
       customerId: customerId,
-      totalSubscriptions: ghlSubscriptions.length,
+      stripeCustomerId: stripeCustomerId,
+      totalSubscriptions: subscriptions.length,
       canceledCount: results.filter(r => r.success).length,
       results: results
     });
@@ -112,35 +140,53 @@ app.post('/webhook/cancel-subscription', async (req, res) => {
 });
 
 /**
- * Get subscriptions from GoHighLevel for a customer
+ * Get contact details from GoHighLevel
  */
-async function getGHLSubscriptions(customerId) {
+async function getGHLContact(contactId) {
   try {
     const response = await axios.get(
-      `${GHL_API_V2}/payments/subscriptions`,
+      `${GHL_API_V2}/contacts/${contactId}`,
       {
         headers: {
           'Authorization': `Bearer ${GHL_API_KEY}`,
           'Version': '2021-07-28',
           'Content-Type': 'application/json'
-        },
-        params: {
-          altId: customerId,
-          altType: 'contact'
         }
       }
     );
     
-    console.log('GoHighLevel subscriptions response:', JSON.stringify(response.data, null, 2));
-    return response.data.subscriptions || [];
+    console.log('GoHighLevel contact retrieved');
+    return response.data.contact;
   } catch (error) {
-    console.error('Error getting GHL subscriptions:', error.response?.data || error.message);
+    console.error('Error getting GHL contact:', error.response?.data || error.message);
+    throw error;
+  }
+}
+
+/**
+ * Get all subscriptions for a Stripe customer
+ */
+async function getStripeSubscriptions(stripeCustomerId) {
+  try {
+    console.log(`Calling Stripe API to get subscriptions for: ${stripeCustomerId}`);
     
-    // If 403 Forbidden, the API key doesn't have permissions
-    if (error.response?.status === 403) {
-      throw new Error('GoHighLevel API key does not have permission to access subscriptions. Please check your Private Integration scopes.');
-    }
+    const response = await axios.get(
+      `${STRIPE_API}/subscriptions`,
+      {
+        headers: {
+          'Authorization': `Bearer ${STRIPE_API_KEY}`
+        },
+        params: {
+          customer: stripeCustomerId,
+          limit: 100
+        }
+      }
+    );
     
+    console.log(`Found ${response.data.data.length} subscription(s) in Stripe`);
+    return response.data.data;
+  } catch (error) {
+    console.error('Error getting Stripe subscriptions:', error.response?.data || error.message);
     throw error;
   }
 }
@@ -213,10 +259,11 @@ app.get('/', (req, res) => {
     },
     workflow: [
       '1. Receives GoHighLevel contact ID',
-      '2. Fetches subscriptions from GoHighLevel',
-      '3. Extracts Stripe subscription IDs from GoHighLevel data',
-      '4. Cancels subscriptions directly in Stripe',
-      '5. Returns cancellation results'
+      '2. Fetches contact from GoHighLevel',
+      '3. Extracts Stripe Customer ID from custom field',
+      '4. Gets all subscriptions from Stripe for that customer',
+      '5. Cancels active/past_due/unpaid subscriptions in Stripe',
+      '6. Returns cancellation results'
     ]
   });
 });
