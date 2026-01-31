@@ -7,10 +7,12 @@ app.use(express.json());
 // Configuration from environment variables
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;
+const STRIPE_API_KEY = process.env.STRIPE_API_KEY;
 const PORT = process.env.PORT || 3000;
 
-// GoHighLevel API v2 Base URL
+// API Base URLs
 const GHL_API_V2 = 'https://services.leadconnectorhq.com';
+const STRIPE_API = 'https://api.stripe.com/v1';
 
 /**
  * Main webhook endpoint for subscription cancellation
@@ -21,7 +23,7 @@ app.post('/webhook/cancel-subscription', async (req, res) => {
     console.log('Timestamp:', new Date().toISOString());
     console.log('Payload:', JSON.stringify(req.body, null, 2));
     
-    const { customerId, subscriptionId } = req.body;
+    const { customerId } = req.body;
     
     // Validate input
     if (!customerId) {
@@ -32,62 +34,54 @@ app.post('/webhook/cancel-subscription', async (req, res) => {
       });
     }
 
-    // If specific subscription ID is provided, cancel only that one
-    if (subscriptionId) {
-      console.log(`Canceling specific subscription: ${subscriptionId}`);
-      const result = await cancelSingleSubscription(subscriptionId);
-      
-      return res.status(result.success ? 200 : 500).json({
-        success: result.success,
-        message: result.message,
-        customerId: customerId,
-        subscriptionId: subscriptionId
-      });
-    }
-
-    // Otherwise, find and cancel all subscriptions for the customer
-    console.log(`Finding all subscriptions for customer: ${customerId}`);
+    // Step 1: Get subscriptions from GoHighLevel
+    console.log(`Getting subscriptions from GoHighLevel for customer: ${customerId}`);
+    const ghlSubscriptions = await getGHLSubscriptions(customerId);
     
-    // Step 1: Verify customer exists
-    const customerExists = await verifyCustomer(customerId);
-    if (!customerExists) {
-      console.error(`Customer not found: ${customerId}`);
+    if (!ghlSubscriptions || ghlSubscriptions.length === 0) {
+      console.log('No subscriptions found in GoHighLevel');
       return res.status(404).json({ 
         success: false, 
-        error: 'Customer not found in GoHighLevel' 
+        error: 'No subscriptions found for this customer in GoHighLevel' 
       });
     }
 
-    // Step 2: Get subscriptions
-    const subscriptions = await getSubscriptionsByCustomer(customerId);
-    
-    if (!subscriptions || subscriptions.length === 0) {
-      console.log('No subscriptions found');
-      return res.status(404).json({ 
-        success: false, 
-        error: 'No subscriptions found for this customer' 
-      });
-    }
+    console.log(`Found ${ghlSubscriptions.length} subscription(s) in GoHighLevel`);
 
-    console.log(`Found ${subscriptions.length} subscription(s)`);
-
-    // Step 3: Cancel all active, trialing, past_due, and unpaid subscriptions
+    // Step 2: Cancel subscriptions in Stripe using IDs from GoHighLevel
     const results = [];
-    for (const sub of subscriptions) {
-      if (sub.status === 'active' || sub.status === 'trialing' || sub.status === 'past_due' || sub.status === 'unpaid') {
-        console.log(`Attempting to cancel subscription ${sub.id} (status: ${sub.status})`);
-        const cancelResult = await cancelSingleSubscription(sub.id);
+    for (const sub of ghlSubscriptions) {
+      // Check if subscription should be canceled based on status
+      const shouldCancel = 
+        sub.status === 'active' || 
+        sub.status === 'trialing' || 
+        sub.status === 'past_due' || 
+        sub.status === 'unpaid' ||
+        sub.status === 'incomplete';
+      
+      if (shouldCancel && sub.entityId) {
+        console.log(`Attempting to cancel Stripe subscription ${sub.entityId} (GHL status: ${sub.status})`);
+        const cancelResult = await cancelStripeSubscription(sub.entityId);
         results.push({
-          subscriptionId: sub.id,
+          ghlSubscriptionId: sub.id,
+          stripeSubscriptionId: sub.entityId,
           status: sub.status,
           ...cancelResult
         });
       } else {
-        console.log(`Skipping subscription ${sub.id} (status: ${sub.status})`);
+        console.log(`Skipping subscription ${sub.id} (status: ${sub.status}, has entityId: ${!!sub.entityId})`);
       }
     }
 
-    // Step 4: Return results
+    if (results.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'No cancellable subscriptions found',
+        totalSubscriptions: ghlSubscriptions.length
+      });
+    }
+
+    // Step 3: Return results
     const allSuccessful = results.every(r => r.success);
     console.log('=== Cancellation Complete ===');
     console.log(`Success: ${allSuccessful}`);
@@ -99,7 +93,7 @@ app.post('/webhook/cancel-subscription', async (req, res) => {
         'All subscriptions canceled successfully' : 
         'Some subscriptions failed to cancel',
       customerId: customerId,
-      totalSubscriptions: subscriptions.length,
+      totalSubscriptions: ghlSubscriptions.length,
       canceledCount: results.filter(r => r.success).length,
       results: results
     });
@@ -118,35 +112,9 @@ app.post('/webhook/cancel-subscription', async (req, res) => {
 });
 
 /**
- * Verify customer exists in GoHighLevel
+ * Get subscriptions from GoHighLevel for a customer
  */
-async function verifyCustomer(customerId) {
-  try {
-    const response = await axios.get(
-      `${GHL_API_V2}/contacts/${customerId}`,
-      {
-        headers: {
-          'Authorization': `Bearer ${GHL_API_KEY}`,
-          'Version': '2021-07-28',
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-    
-    return response.status === 200 && response.data.contact;
-  } catch (error) {
-    if (error.response?.status === 404) {
-      return false;
-    }
-    console.error('Error verifying customer:', error.response?.data || error.message);
-    throw error;
-  }
-}
-
-/**
- * Get all subscriptions for a customer
- */
-async function getSubscriptionsByCustomer(customerId) {
+async function getGHLSubscriptions(customerId) {
   try {
     const response = await axios.get(
       `${GHL_API_V2}/payments/subscriptions`,
@@ -163,15 +131,14 @@ async function getSubscriptionsByCustomer(customerId) {
       }
     );
     
-    console.log('Subscriptions API response:', JSON.stringify(response.data, null, 2));
+    console.log('GoHighLevel subscriptions response:', JSON.stringify(response.data, null, 2));
     return response.data.subscriptions || [];
   } catch (error) {
-    console.error('Error fetching subscriptions:', error.response?.data || error.message);
+    console.error('Error getting GHL subscriptions:', error.response?.data || error.message);
     
-    // If API endpoint changed or not available, try alternative method
-    if (error.response?.status === 404) {
-      console.log('Trying alternative subscription lookup method...');
-      return await getSubscriptionsAlternative(customerId);
+    // If 403 Forbidden, the API key doesn't have permissions
+    if (error.response?.status === 403) {
+      throw new Error('GoHighLevel API key does not have permission to access subscriptions. Please check your Private Integration scopes.');
     }
     
     throw error;
@@ -179,64 +146,39 @@ async function getSubscriptionsByCustomer(customerId) {
 }
 
 /**
- * Alternative method to get subscriptions
+ * Cancel a Stripe subscription
  */
-async function getSubscriptionsAlternative(customerId) {
+async function cancelStripeSubscription(subscriptionId) {
   try {
-    // Try to get subscriptions through orders endpoint
-    const response = await axios.get(
-      `${GHL_API_V2}/payments/orders`,
-      {
-        headers: {
-          'Authorization': `Bearer ${GHL_API_KEY}`,
-          'Version': '2021-07-28',
-          'Content-Type': 'application/json'
-        },
-        params: {
-          contactId: customerId,
-          locationId: GHL_LOCATION_ID
-        }
-      }
-    );
+    console.log(`Calling Stripe API to cancel subscription: ${subscriptionId}`);
     
-    // Filter for subscription orders
-    const orders = response.data.orders || [];
-    return orders.filter(order => order.recurring === true);
-  } catch (error) {
-    console.error('Alternative subscription lookup failed:', error.response?.data || error.message);
-    return [];
-  }
-}
-
-/**
- * Cancel a single subscription
- */
-async function cancelSingleSubscription(subscriptionId) {
-  try {
     const response = await axios.delete(
-      `${GHL_API_V2}/payments/subscriptions/${subscriptionId}`,
+      `${STRIPE_API}/subscriptions/${subscriptionId}`,
       {
         headers: {
-          'Authorization': `Bearer ${GHL_API_KEY}`,
-          'Version': '2021-07-28',
-          'Content-Type': 'application/json'
+          'Authorization': `Bearer ${STRIPE_API_KEY}`
         }
       }
     );
     
-    console.log(`✓ Successfully canceled subscription ${subscriptionId}`);
+    console.log(`✓ Successfully canceled Stripe subscription ${subscriptionId}`);
+    console.log('Stripe response:', JSON.stringify(response.data, null, 2));
+    
     return {
       success: true,
-      message: 'Subscription canceled successfully'
+      message: 'Subscription canceled successfully in Stripe',
+      canceledAt: new Date().toISOString(),
+      stripeStatus: response.data.status
     };
   } catch (error) {
-    console.error(`✗ Failed to cancel subscription ${subscriptionId}:`, 
+    console.error(`✗ Failed to cancel Stripe subscription ${subscriptionId}:`, 
       error.response?.data || error.message);
     
     return {
       success: false,
-      message: error.response?.data?.message || error.message,
-      errorCode: error.response?.status
+      message: error.response?.data?.error?.message || error.message,
+      errorCode: error.response?.status,
+      errorType: error.response?.data?.error?.type
     };
   }
 }
@@ -245,28 +187,37 @@ async function cancelSingleSubscription(subscriptionId) {
 app.get('/health', (req, res) => {
   res.status(200).json({ 
     status: 'healthy',
-    service: 'GHL Subscription Cancellation',
+    service: 'GHL + Stripe Subscription Cancellation',
     timestamp: new Date().toISOString(),
-    version: '1.0.0'
+    version: '2.0.0',
+    integrations: {
+      goHighLevel: !!GHL_API_KEY,
+      stripe: !!STRIPE_API_KEY
+    }
   });
 });
 
 // Root endpoint
 app.get('/', (req, res) => {
   res.status(200).json({
-    service: 'GoHighLevel Subscription Cancellation Webhook',
+    service: 'GoHighLevel + Stripe Subscription Cancellation Webhook',
     endpoints: {
       health: 'GET /health',
       webhook: 'POST /webhook/cancel-subscription'
     },
     webhookPayload: {
       required: ['customerId'],
-      optional: ['subscriptionId'],
       example: {
-        customerId: 'contact_id_here',
-        subscriptionId: 'optional_subscription_id'
+        customerId: 'contact_id_from_ghl'
       }
-    }
+    },
+    workflow: [
+      '1. Receives GoHighLevel contact ID',
+      '2. Fetches subscriptions from GoHighLevel',
+      '3. Extracts Stripe subscription IDs from GoHighLevel data',
+      '4. Cancels subscriptions directly in Stripe',
+      '5. Returns cancellation results'
+    ]
   });
 });
 
@@ -282,14 +233,18 @@ app.use((err, req, res, next) => {
 
 // Start server
 const server = app.listen(PORT, () => {
-  console.log('=====================================');
-  console.log('GHL Subscription Cancellation Service');
-  console.log('=====================================');
+  console.log('=========================================');
+  console.log('GHL + Stripe Subscription Cancellation');
+  console.log('=========================================');
   console.log(`Status: Running`);
   console.log(`Port: ${PORT}`);
-  console.log(`Webhook URL: http://localhost:${PORT}/webhook/cancel-subscription`);
-  console.log(`Health Check: http://localhost:${PORT}/health`);
-  console.log('=====================================');
+  console.log(`Webhook: http://localhost:${PORT}/webhook/cancel-subscription`);
+  console.log(`Health: http://localhost:${PORT}/health`);
+  console.log('=========================================');
+  console.log('API Configuration:');
+  console.log(`  GoHighLevel: ${GHL_API_KEY ? '✓' : '✗'}`);
+  console.log(`  Stripe: ${STRIPE_API_KEY ? '✓' : '✗'}`);
+  console.log('=========================================');
   console.log('Waiting for webhooks...');
 });
 
