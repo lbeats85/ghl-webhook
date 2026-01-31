@@ -46,17 +46,23 @@ app.post('/webhook/cancel-subscription', async (req, res) => {
       });
     }
 
-    // Get Stripe Customer ID from custom field
-    const stripeCustomerId = contact.customField?.stripe_customer_id || 
-                             contact.customFields?.stripe_customer_id ||
-                             contact.stripe_customer_id;
+    // Get Stripe Customer ID from custom fields
+    // Look for a value that starts with 'cus_' (Stripe customer ID pattern)
+    let stripeCustomerId = null;
+    
+    if (contact.customFields && Array.isArray(contact.customFields)) {
+      const customerIdField = contact.customFields.find(field => 
+        field.value && typeof field.value === 'string' && field.value.startsWith('cus_')
+      );
+      stripeCustomerId = customerIdField?.value;
+    }
 
     if (!stripeCustomerId) {
-      console.error('Stripe Customer ID not found in contact');
-      console.log('Contact data:', JSON.stringify(contact, null, 2));
+      console.error('Stripe Customer ID not found in contact custom fields');
+      console.log('Available custom fields:', JSON.stringify(contact.customFields, null, 2));
       return res.status(404).json({ 
         success: false, 
-        error: 'Stripe Customer ID not found in GoHighLevel contact. Please ensure the "Stripe Customer Id" custom field (stripe_customer_id) is populated.' 
+        error: 'Stripe Customer ID not found in GoHighLevel contact. Please ensure a custom field contains a Stripe Customer ID (starts with cus_).' 
       });
     }
 
