@@ -15,7 +15,8 @@ const GHL_API_V2 = 'https://services.leadconnectorhq.com';
 const STRIPE_API = 'https://api.stripe.com/v1';
 
 /**
- * Main webhook endpoint for subscription cancellation
+ * Cancel subscription in Stripe AND return days remaining for access revocation
+ * This does BOTH: cancels the subscription + tells you how long to keep access
  */
 app.post('/webhook/cancel-subscription', async (req, res) => {
   try {
@@ -23,7 +24,7 @@ app.post('/webhook/cancel-subscription', async (req, res) => {
     console.log('Timestamp:', new Date().toISOString());
     console.log('Payload:', JSON.stringify(req.body, null, 2));
     
-    const { customerId } = req.body;
+    const { customerId, cancelInStripe = false } = req.body;
     
     // Validate input
     if (!customerId) {
@@ -33,6 +34,9 @@ app.post('/webhook/cancel-subscription', async (req, res) => {
         error: 'customerId is required in the request body' 
       });
     }
+
+    console.log(`Cancel in Stripe: ${cancelInStripe ? 'YES' : 'NO (calculate only)'}`);
+
 
     // Step 1: Get contact from GoHighLevel to retrieve Stripe Customer ID
     console.log(`Getting contact from GoHighLevel: ${customerId}`);
@@ -82,54 +86,91 @@ app.post('/webhook/cancel-subscription', async (req, res) => {
 
     console.log(`Found ${subscriptions.length} subscription(s) in Stripe`);
 
-    // Step 3: Cancel subscriptions that are active, trialing, past_due, unpaid, or incomplete
-    const results = [];
+    // Step 3: BEFORE canceling, calculate days remaining for access
+    const now = Math.floor(Date.now() / 1000);
+    let accessDaysRemaining = 0;
+    let accessEndDate = null;
+    
+    // Find the active subscription with the furthest end date
     for (const sub of subscriptions) {
-      const shouldCancel = 
+      const isActive = 
         sub.status === 'active' || 
         sub.status === 'trialing' || 
         sub.status === 'past_due' || 
         sub.status === 'unpaid' ||
         sub.status === 'incomplete';
       
-      if (shouldCancel) {
-        console.log(`Attempting to cancel Stripe subscription ${sub.id} (status: ${sub.status})`);
-        const cancelResult = await cancelStripeSubscription(sub.id);
-        results.push({
-          subscriptionId: sub.id,
-          status: sub.status,
-          ...cancelResult
-        });
-      } else {
-        console.log(`Skipping subscription ${sub.id} (status: ${sub.status} - already canceled or ended)`);
+      if (isActive && sub.current_period_end) {
+        const daysLeft = Math.ceil((sub.current_period_end - now) / (60 * 60 * 24));
+        if (daysLeft > accessDaysRemaining) {
+          accessDaysRemaining = daysLeft;
+          accessEndDate = new Date(sub.current_period_end * 1000).toISOString();
+        }
       }
     }
 
-    if (results.length === 0) {
-      return res.status(200).json({
-        success: true,
-        message: 'No active subscriptions to cancel',
-        totalSubscriptions: subscriptions.length,
-        canceledCount: 0
-      });
+    console.log('=== Access Period Calculation ===');
+    console.log(`Days of access remaining: ${accessDaysRemaining}`);
+    console.log(`Access should end on: ${accessEndDate || 'N/A'}`);
+
+    // Step 4: Optionally cancel subscriptions in Stripe (if requested)
+    const results = [];
+    
+    if (cancelInStripe) {
+      console.log('=== Canceling Subscriptions in Stripe ===');
+      for (const sub of subscriptions) {
+        const shouldCancel = 
+          sub.status === 'active' || 
+          sub.status === 'trialing' || 
+          sub.status === 'past_due' || 
+          sub.status === 'unpaid' ||
+          sub.status === 'incomplete';
+        
+        if (shouldCancel) {
+          console.log(`Attempting to cancel Stripe subscription ${sub.id} (status: ${sub.status})`);
+          const cancelResult = await cancelStripeSubscription(sub.id);
+          results.push({
+            subscriptionId: sub.id,
+            status: sub.status,
+            ...cancelResult
+          });
+        } else {
+          console.log(`Skipping subscription ${sub.id} (status: ${sub.status} - already canceled or ended)`);
+        }
+      }
+    } else {
+      console.log('=== Skipping Stripe Cancellation (calculate only mode) ===');
     }
 
-    // Step 4: Return results
-    const allSuccessful = results.every(r => r.success);
-    console.log('=== Cancellation Complete ===');
-    console.log(`Success: ${allSuccessful}`);
-    console.log(`Canceled: ${results.filter(r => r.success).length}/${results.length}`);
+    // Step 5: Return results including access information
+    const allSuccessful = results.length === 0 || results.every(r => r.success);
+    console.log('=== Processing Complete ===');
+    console.log(`Stripe Cancellation: ${cancelInStripe ? 'Performed' : 'Skipped'}`);
+    if (cancelInStripe) {
+      console.log(`Canceled: ${results.filter(r => r.success).length}/${results.length}`);
+    }
+    console.log(`Customer should keep access for: ${accessDaysRemaining} days`);
 
     return res.status(allSuccessful ? 200 : 207).json({
       success: allSuccessful,
-      message: allSuccessful ? 
-        'All subscriptions canceled successfully' : 
-        'Some subscriptions failed to cancel',
+      message: cancelInStripe ? 
+        (allSuccessful ? 'Subscriptions canceled and access period calculated' : 'Some operations failed') :
+        'Access period calculated (Stripe cancellation skipped)',
+      mode: cancelInStripe ? 'cancel-and-calculate' : 'calculate-only',
       customerId: customerId,
       stripeCustomerId: stripeCustomerId,
       totalSubscriptions: subscriptions.length,
-      canceledCount: results.filter(r => r.success).length,
-      results: results
+      canceledCount: cancelInStripe ? results.filter(r => r.success).length : 0,
+      stripeCancellation: cancelInStripe ? results : 'skipped',
+      // Access information for GoHighLevel automation
+      accessDaysRemaining: Math.max(0, accessDaysRemaining),
+      accessEndDate: accessEndDate,
+      revokeAccessIn: Math.max(0, accessDaysRemaining),
+      nextStep: {
+        action: 'Wait then revoke access',
+        waitDays: Math.max(0, accessDaysRemaining),
+        description: `Keep customer access active for ${accessDaysRemaining} days, then trigger access revocation automation`
+      }
     });
 
   } catch (error) {
@@ -241,7 +282,7 @@ app.get('/health', (req, res) => {
     status: 'healthy',
     service: 'GHL + Stripe Subscription Cancellation',
     timestamp: new Date().toISOString(),
-    version: '2.0.0',
+    version: '3.0.0',
     integrations: {
       goHighLevel: !!GHL_API_KEY,
       stripe: !!STRIPE_API_KEY
@@ -253,24 +294,64 @@ app.get('/health', (req, res) => {
 app.get('/', (req, res) => {
   res.status(200).json({
     service: 'GoHighLevel + Stripe Subscription Cancellation Webhook',
+    version: '3.0.0',
     endpoints: {
       health: 'GET /health',
-      webhook: 'POST /webhook/cancel-subscription'
+      cancelSubscription: 'POST /webhook/cancel-subscription'
     },
     webhookPayload: {
       required: ['customerId'],
-      example: {
-        customerId: 'contact_id_from_ghl'
+      optional: ['cancelInStripe'],
+      examples: {
+        calculateOnly: {
+          customerId: 'contact_id_from_ghl',
+          cancelInStripe: false
+        },
+        cancelAndCalculate: {
+          customerId: 'contact_id_from_ghl',
+          cancelInStripe: true
+        }
+      }
+    },
+    modes: {
+      calculateOnly: {
+        description: 'Just calculate access days remaining (if you handle Stripe cancellation elsewhere)',
+        payload: { customerId: 'abc123', cancelInStripe: false },
+        use: 'When you already have Stripe cancellation set up separately'
+      },
+      cancelAndCalculate: {
+        description: 'Cancel in Stripe AND calculate access days',
+        payload: { customerId: 'abc123', cancelInStripe: true },
+        use: 'When you want this webhook to handle everything'
       }
     },
     workflow: [
-      '1. Receives GoHighLevel contact ID',
-      '2. Fetches contact from GoHighLevel',
-      '3. Extracts Stripe Customer ID from custom field',
-      '4. Gets all subscriptions from Stripe for that customer',
-      '5. Cancels active/past_due/unpaid subscriptions in Stripe',
-      '6. Returns cancellation results'
-    ]
+      '1. Customer clicks cancel button',
+      '2. (Optional) Your existing system cancels Stripe subscription',
+      '3. GoHighLevel calls this webhook with contact ID',
+      '4. Webhook fetches subscription from Stripe',
+      '5. Webhook calculates days remaining in billing period',
+      '6. (Optional) Webhook can also cancel in Stripe if cancelInStripe=true',
+      '7. Webhook returns: days of access remaining',
+      '8. GoHighLevel waits X days (customer keeps access)',
+      '9. After X days: GoHighLevel triggers "revoke access" automation',
+      '10. Automation removes tags, access, permissions, etc.'
+    ],
+    exampleResponse: {
+      success: true,
+      message: 'Access period calculated (Stripe cancellation skipped)',
+      mode: 'calculate-only',
+      canceledCount: 0,
+      stripeCancellation: 'skipped',
+      accessDaysRemaining: 25,
+      accessEndDate: '2026-02-25T00:00:00.000Z',
+      revokeAccessIn: 25,
+      nextStep: {
+        action: 'Wait then revoke access',
+        waitDays: 25,
+        description: 'Keep customer access for 25 days, then revoke'
+      }
+    }
   });
 });
 
